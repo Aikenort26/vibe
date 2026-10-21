@@ -49,7 +49,7 @@ export interface InstalledModel extends NamedPath {
 	reason: string | null
 }
 
-interface ModelFileCheck {
+export interface ModelFileCheck {
 	path: string
 	valid: boolean
 	size: number
@@ -123,7 +123,9 @@ interface DownloadModelOptions {
 
 export async function downloadModel(source: string | ModelDownload, options: DownloadModelOptions = {}) {
 	const { url, ...integrity }: ModelDownload = typeof source === 'string' ? { url: source } : source
-	const modelPath = options.replacePath ?? (await resolveDownloadPath(url))
+	const target = options.replacePath ? { path: options.replacePath, existing: false } : await resolveDownloadPath(url, integrity)
+	if (target.existing) return target.path
+	const modelPath = target.path
 	const result = await invoke<DownloadModelResult>('download_model', { url, path: modelPath, integrity: toIntegrity(integrity) })
 	return result.status === 'completed' ? result.path : null
 }
@@ -132,22 +134,37 @@ function toIntegrity(integrity: ModelIntegrity): ModelIntegrity | undefined {
 	return integrity.size === undefined && integrity.sha256 === undefined ? undefined : integrity
 }
 
+/** The name used when a URL has none of its own — and the one some repos ship their weights under. */
+const GENERIC_MODEL_FILENAME = 'ggml-model.bin'
+
 /**
- * Where a download should land. A name already taken by a healthy model gets a random suffix so the
- * two can coexist, but one taken by a corrupt file is reused: retrying a failed download must
- * replace the broken file instead of leaving it behind next to a second copy.
+ * Whether a file already on disk under the URL's own name is the model being asked for. Without a
+ * published size the name is all there is to go on, so the generic name never counts.
  */
-async function resolveDownloadPath(url: string) {
+export function isSameModel(filename: string, check: ModelFileCheck | undefined, integrity: ModelIntegrity) {
+	if (!check?.valid || filename.toLowerCase() === GENERIC_MODEL_FILENAME) return false
+	return integrity.size === undefined || integrity.size === check.size
+}
+
+/**
+ * Where a download should land. The same model already on disk is used as is: downloading it again
+ * only left a randomly named 1.6 GB copy behind on every retry. A name taken by a different healthy
+ * model gets a random suffix so the two can coexist, and one taken by a corrupt file is reused:
+ * retrying a failed download must replace the broken file instead of leaving it next to a second copy.
+ */
+async function resolveDownloadPath(url: string, integrity: ModelIntegrity) {
 	let filename = await getFilenameFromUrl(url)
 	if (!isModelFile(filename)) {
-		filename = 'ggml-model.bin'
+		filename = GENERIC_MODEL_FILENAME
 	}
 	const modelsFolder = await getModelsFolder()
 	const modelPath = await pathExt.join(modelsFolder, filename)
-	if (!(await fsExt.exists(modelPath)) || !(await isModelFileUsable(modelPath))) {
-		return modelPath
-	}
-	return pathExt.join(modelsFolder, randomString(8, 'ggml-model_', `.${getModelExtension(filename) ?? 'bin'}`))
+	if (!(await fsExt.exists(modelPath))) return { path: modelPath, existing: false }
+	const [check] = await checkModelFiles([modelPath])
+	if (check && !check.valid) return { path: modelPath, existing: false }
+	if (isSameModel(filename, check, integrity)) return { path: modelPath, existing: true }
+	const path = await pathExt.join(modelsFolder, randomString(8, 'ggml-model_', `.${getModelExtension(filename) ?? 'bin'}`))
+	return { path, existing: false }
 }
 
 export function isModelFile(filename: string) {
