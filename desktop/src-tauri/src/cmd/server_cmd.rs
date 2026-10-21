@@ -133,6 +133,9 @@ pub async fn load_model(
         server.load_model(&model_path, gpu_device, no_gpu).await
     };
 
+    // The build the current process runs on; the CPU fallback below must not undo a switch to baseline.
+    let mut effective_variant = cpu_variant;
+
     // A CPU that advertises AVX2 it cannot execute kills the engine on the first AVX2
     // instruction, while the model loads. Once is enough to know: relaunch on the baseline
     // build, and keep that choice so the next launch does not die again first (#1499).
@@ -150,7 +153,8 @@ pub async fn load_model(
             None,
         );
         state_guard.process = None;
-        let process = spawn_server(crate::cmd::config::CpuVariant::Baseline)
+        effective_variant = crate::cmd::config::CpuVariant::Baseline;
+        let process = spawn_server(effective_variant)
             .context("failed to respawn server on the baseline CPU build")?;
         state_guard.process = Some(process);
         load_result = state_guard
@@ -175,11 +179,15 @@ pub async fn load_model(
             if let Some(mut old) = state_guard.process.take() {
                 old.kill();
             }
-            let process = spawn_server(crate::cmd::config::cpu_variant(&app_handle)).context("failed to respawn server")?;
+            // Respawning on the configured variant would put a CPU that just died on AVX2 back on it.
+            let process = spawn_server(effective_variant).context("failed to respawn server")?;
             state_guard.process = Some(process);
 
             let server = state_guard.process.as_mut().unwrap();
             server.load_model(&model_path, gpu_device, true).await?;
+            if effective_variant != cpu_variant {
+                crate::cmd::config::set_cpu_variant(&app_handle, effective_variant).log_error();
+            }
             true
         }
     };
